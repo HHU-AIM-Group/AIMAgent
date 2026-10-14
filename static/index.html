@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#183c32"><meta name="description" content="面向多模态研究组的本地研究前沿雷达与每周研究简报。">
+  <title>AIM Radar · 研究前沿雷达</title>
+  <link rel="stylesheet" href="/static/styles.css"><script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">跳转到主要内容</a>
+<div class="app-shell">
+  <aside class="sidebar">
+    <a class="brand" href="#overview" aria-label="AIM Radar 首页"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span><span>AIM<span class="brand-light"> Radar</span><small>研究前沿雷达</small></span></a>
+    <div class="sidebar-caption">研究工作台 <span>WORKSPACE</span></div>
+    <nav id="navigation" aria-label="主导航">
+      <button class="nav-item active" data-view="overview"><span class="nav-icon">◫</span>本周概览<span class="nav-arrow">↗</span></button>
+      <button class="nav-item" data-view="papers"><span class="nav-icon">▤</span>论文精选<span class="nav-count" id="nav-paper-count">—</span></button>
+      <button class="nav-item" data-view="news"><span class="nav-icon">◉</span>行业动态</button>
+      <button class="nav-item" data-view="conferences"><span class="nav-icon">⌘</span>会议雷达</button>
+      <button class="nav-item" data-view="saved"><span class="nav-icon">☆</span>我的阅读清单<span class="nav-count" id="nav-saved-count">0</span></button>
+      <div class="nav-divider"></div>
+      <button class="nav-item" data-view="history"><span class="nav-icon">◷</span>历史周报</button>
+      <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span>设置与连接</button>
+    </nav>
+    <a class="group-card" href="https://multimodality.group/" target="_blank" rel="noopener noreferrer"><span class="group-mark">AIM</span><strong>多模态智能研究组</strong><span>让研究线索，连接研究方向。</span><span class="group-link">multimodality.group ↗</span></a>
+    <div class="local-label"><span class="status-dot"></span> 本地工作空间 <span class="local-lock">⌁</span><small>连接你自己的 Codex</small></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="breadcrumb">AIM Radar <span>/</span> <strong id="breadcrumb">本周概览</strong></div><button id="connection-button" class="connection"><span class="status-dot muted"></span><span id="connection-label">正在检查连接</span><span>↗</span></button></header>
+    <main id="main" tabindex="-1">
+      <section class="hero"><div><div class="eyebrow"><span></span> SIGNALS FOR YOUR NEXT IDEA</div><h1 id="page-title">这周，值得读什么？</h1><p id="page-description">从海量信息中，找到与你的研究真正相关的进展。</p></div><div class="hero-note"><span>FOCUSED ON WHAT MATTERS</span><strong>五个研究方向<br>一份清晰的每周简报</strong></div></section>
+      <div id="global-notice" class="notice hidden" role="status"></div>
+      <section class="period-bar" id="period-bar" aria-label="周报日期范围">
+        <div class="period-inputs"><span class="calendar-icon" aria-hidden="true">▦</span><label><span class="sr-only">开始日期</span><input type="date" id="start-date" required></label><span class="date-separator">—</span><label><span class="sr-only">结束日期</span><input type="date" id="end-date" required></label><span class="timezone">北京时间</span></div>
+        <div class="period-actions"><div class="segmented" aria-label="快捷日期"><button data-period="week" class="selected">本周</button><button data-period="last">上周</button><button data-period="seven">近 7 天</button></div><button id="generate-button" class="button primary"><span aria-hidden="true">✦</span> 生成本周周报</button></div>
+      </section>
+      <section id="job-panel" class="job-panel hidden" aria-live="polite"><div class="job-heading"><span class="spinner" aria-hidden="true"></span><strong id="job-stage">正在收集研究进展</strong><span id="job-percent">0%</span></div><div class="progress-track"><div id="job-progress"></div></div><p id="job-message"></p></section>
+      <div id="report-context" class="report-context hidden"><span id="report-identity"></span><div><span id="analysis-badge" class="badge"></span><button id="export-md" class="text-button">导出 Markdown ↓</button><button id="export-json" class="text-button">JSON ↓</button></div></div>
+      <section id="content-view"></section>
+      <footer class="page-footer"><span>AIM Radar <i>·</i> 研究始于好问题。</span><span>以原始来源为准 · 摘要辅助阅读 · Asia/Shanghai</span></footer>
+    </main>
+  </div>
+</div>
+<dialog id="detail-dialog" aria-labelledby="detail-title"><div class="dialog-top"><span class="eyebrow">RESEARCH NOTE</span><button class="icon-button" id="close-detail" aria-label="关闭详情">×</button></div><div id="detail-content"></div></dialog>
+<div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>

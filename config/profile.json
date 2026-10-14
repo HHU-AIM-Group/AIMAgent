@@ -1,0 +1,108 @@
+{
+  "name": "AIM Radar · 多模态研究周报",
+  "url": "https://multimodality.group/",
+  "description": "基于团队公开研究方向的论文、会议与产业动态雷达。",
+  "timezone": "Asia/Shanghai",
+  "directions": [
+    {
+      "id": "remote_sensing",
+      "name": "遥感多模态基础模型及下游适配",
+      "description": "遥感视觉语言基础模型、分割、推理与智能体。",
+      "keywords": [
+        "remote sensing",
+        "satellite",
+        "aerial image",
+        "earth observation",
+        "geospatial",
+        "remoteclip",
+        "remotesam",
+        "remotereasoner"
+      ],
+      "anchors": [
+        "RemoteCLIP",
+        "RemoteSAM (ACM MM2025)",
+        "RemoteReasoner (AAAI2026)",
+        "RemoteAgent (TGRS2026)",
+        "RemoteShield",
+        "RemoteDescriber / ReconScore"
+      ]
+    },
+    {
+      "id": "uav",
+      "name": "无人机多模态环境感知与世界动作模型",
+      "description": "无人机感知、视觉语言导航、世界模型与动作规划。",
+      "keywords": [
+        "uav",
+        "drone",
+        "aerial navigation",
+        "vision language action",
+        "vision-language-action",
+        "world model",
+        "embodied",
+        "visual navigation"
+      ],
+      "anchors": [
+        "AirNavigation (AAAI2026 Demo)",
+        "UEMM-Air (ACM MM2025 dataset)"
+      ]
+    },
+    {
+      "id": "few_shot",
+      "name": "预训练基础模型的小样本下游泛化",
+      "description": "视觉语言基础模型少样本学习、适配与泛化。",
+      "keywords": [
+        "few-shot",
+        "few shot",
+        "low-shot",
+        "test-time adaptation",
+        "prompt learning",
+        "parameter efficient",
+        "domain generalization",
+        "in-context learning"
+      ],
+      "anchors": [
+        "Making Large Vision Language Models Better Few-Shot Learners (TIP2026)",
+        "Making Large Vision Language Models to be Good Few-shot Learners (AAAI2025)"
+      ]
+    },
+    {
+      "id": "hallucination",
+      "name": "多模态大模型幻觉抑制",
+      "description": "多模态幻觉检测、缓解、可信推理及评估。",
+      "keywords": [
+        "hallucination",
+        "visual grounding",
+        "faithfulness",
+        "multimodal reliability",
+        "multimodal factual",
+        "vision language safety"
+      ],
+      "anchors": [
+        "RemoteShield",
+        "RemoteDescriber / ReconScore"
+      ]
+    },
+    {
+      "id": "noisy_labels",
+      "name": "标签噪声关联学习",
+      "description": "噪声标签、跨模态错误对应与鲁棒学习。",
+      "keywords": [
+        "noisy label",
+        "label noise",
+        "noisy correspondence",
+        "noisy supervision",
+        "robust multimodal",
+        "mislabeled",
+        "cross-modal correspondence"
+      ],
+      "anchors": [
+        "Rethinking Noisy Correspondence via Cross-Modal Collaborative Representation (ACM MM2026)",
+        "Rethinking Multilabel Remote Sensing Image Classification under Dual-Distribution Instance-Dependent Noise (TGRS2026)",
+        "VLKD-YOLO underwater detection"
+      ]
+    }
+  ],
+  "background_note": "团队论文与录用信息仅用于匹配研究方向，不作为本周新增成果。",
+  "source_url": "https://multimodality.group/",
+  "as_of": "2026-10-14"
+}
