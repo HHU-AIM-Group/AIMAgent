@@ -7,6 +7,7 @@ import mimetypes
 import re
 import secrets
 import threading
+import time
 import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +17,8 @@ from codex_bridge import codex_status
 from pipeline import DEFAULT_SETTINGS, collect_report, default_window, report_markdown, validate_window
 from sources import validate_public_url
 from storage import Store
+from analysis import analyze
+from tracking import tracking_state, track_item, check_tracked
 
 ROOT = Path(__file__).resolve().parent
 
@@ -84,11 +87,89 @@ class RadarApp:
             if self.active_job:
                 raise RuntimeError('已有采集任务正在运行')
             job_id = uuid.uuid4().hex[:16]
-            job = dict(id=job_id,status='queued',progress=0,stage='queued',message='等待采集',report_id=None,error=None)
+            job = dict(id=job_id,type='report',status='queued',progress=0,stage='queued',message='等待采集',report_id=None,error=None)
             self.jobs[job_id],self.active_job = job,job_id
             settings = copy.deepcopy(self.settings)
         threading.Thread(target=self._run,args=(job_id,start,end,use_codex,settings),daemon=True).start()
         return copy.deepcopy(job)
+    def resolve_item(self, payload):
+        if not isinstance(payload,dict): raise ValueError('参数必须为 JSON 对象')
+        report_id, item_id = payload.get('report_id'), payload.get('item_id')
+        if report_id is not None and (not isinstance(report_id,str) or not re.fullmatch(r'[a-f0-9]{16}',report_id)): raise ValueError('报告 ID 无效')
+        if item_id is not None and (not isinstance(item_id,str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}',item_id)): raise ValueError('条目 ID 无效')
+        if report_id:
+            report = self.store.report(report_id)
+            if not report: raise ValueError('报告不存在')
+            item = next((row for row in report.get('papers',[])+report.get('news',[]) if row['id']==item_id),None)
+            if item is None: raise ValueError('条目不存在')
+            return copy.deepcopy(item)
+        if item_id:
+            for row in self.store.get('tracking:items',[]):
+                if row['id']==item_id or row['item']['id']==item_id: return copy.deepcopy(row['item'])
+            for report in self.store.reports():
+                item=next((r for r in report.get('papers',[])+report.get('news',[]) if r['id']==item_id),None)
+                if item: return copy.deepcopy(item)
+        item = payload.get('item')
+        if not isinstance(item,dict) or not isinstance(item.get('id'),str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}',item['id']) or not isinstance(item.get('title'),str) or not isinstance(item.get('url'),str):
+            raise ValueError('需要有效 report_id/item_id 或收藏 item 快照')
+        result = {key:copy.deepcopy(item[key]) for key in ('id','title','url','abstract','directions','kind','arxiv_id','pdf_url','full_text_url','related_work') if key in item}
+        if len(result['title'])>1000 or len(result['url'])>2000: raise ValueError('条目字段过长')
+        if not isinstance(result.get('directions',[]),list) or any(not isinstance(v,str) for v in result.get('directions',[])): raise ValueError('方向字段无效')
+        for key in ('url','pdf_url','full_text_url'):
+            if result.get(key): validate_public_url(result[key],resolve=False)
+        if result.get('arxiv_id') and (not isinstance(result['arxiv_id'],str) or not re.fullmatch(r'(?:\d{4}\.\d{4,5}|[a-z-]+/\d{7})(?:v\d+)?',result['arxiv_id'])): raise ValueError('arXiv ID 无效')
+        return result
+
+    def start_aux(self, kind, payload):
+        if not isinstance(payload,dict): raise ValueError('参数必须为 JSON 对象')
+        allowed = {'report_id','item_id','item'} if kind=='analysis' else set()
+        if set(payload)-allowed: raise ValueError('参数字段无效')
+        item=self.resolve_item(payload) if kind=='analysis' else None
+        if item and item.get('kind','paper')!='paper': raise ValueError('单篇深读仅支持论文')
+        with self.lock:
+            if self.active_job: raise RuntimeError('已有任务正在运行')
+            job_id=uuid.uuid4().hex[:16]
+            job=dict(id=job_id,type=kind,item_id=item['id'] if item else None,status='queued',progress=0,stage='queued',message='等待全文深读' if kind=='analysis' else '等待追踪检查',report_id=None,error=None)
+            self.jobs[job_id]=job; self.active_job=job_id
+            settings=copy.deepcopy(self.settings)
+        threading.Thread(target=self._run_aux,args=(job_id,kind,item,settings),daemon=True).start()
+        return copy.deepcopy(job)
+
+    def _run_aux(self, job_id, kind, item, settings):
+        try:
+            with self.lock: self.jobs[job_id].update(status='running',progress=10,stage=kind,message='正在获取全文与基准证据' if kind=='analysis' else '正在检查已标记论文和仓库')
+            result=analyze(item,self.profile,settings,self.store,self.data_dir) if kind=='analysis' else check_tracked(self.store)
+            if kind=='analysis':
+                previous=self.store.get('analysis:'+item['id'])
+                if previous and previous.get('status')=='completed' and result.get('status')=='insufficient':
+                    raise RuntimeError('本次未取得足够的新证据，已保留上次成功的全文核对结果。')
+                self.store.set('analysis:'+item['id'],result)
+                # Persist the detail into existing report items while preserving older reports' shape.
+                for report in self.store.reports():
+                    changed=False
+                    for row in report.get('papers',[]):
+                        if row['id']==item['id']: row['research_analysis']=result; changed=True
+                    if changed: self.store.save_report(report)
+            with self.lock:
+                self.jobs[job_id].update(status='completed',progress=100,stage='completed',message='深读已保存' if kind=='analysis' else '追踪检查已保存',**({'analysis':result} if kind=='analysis' else {'result':result}))
+        except Exception as exc:
+            with self.lock: self.jobs[job_id].update(status='failed',stage='failed',message='任务未完成，可稍后重试',error=str(exc)[:400])
+        finally:
+            with self.lock: self.active_job=None
+
+    def start_scheduler(self):
+        if getattr(self,'scheduler_started',False): return
+        self.scheduler_started=True; self.scheduler_stop=threading.Event()
+        def maintain():
+            while not self.scheduler_stop.wait(60):
+                last=self.store.get('tracking:last_checked_at')
+                parsed=__import__('sources').parse_date(last)
+                due=not parsed or time.time()-parsed.timestamp()>=86400
+                if due and self.store.get('tracking:items',[]):
+                    try: self.start_aux('tracking',{})
+                    except RuntimeError: pass
+        threading.Thread(target=maintain,daemon=True).start()
+
     def _run(self, job_id, start, end, use_codex, settings):
         def progress(percent,stage,message):
             with self.lock:
@@ -113,6 +194,10 @@ class RadarServer(ThreadingHTTPServer):
             raise ValueError('AIM Radar only binds to 127.0.0.1')
         self.app = app or RadarApp()
         super().__init__(address,Handler)
+        self.app.start_scheduler()
+    def server_close(self):
+        if hasattr(self.app,'scheduler_stop'): self.app.scheduler_stop.set()
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -175,6 +260,11 @@ class Handler(BaseHTTPRequestHandler):
         app = self.server.app
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
+        if path=='/api/tracking':
+            return self._json(200,tracking_state(app.store))
+        match=re.fullmatch(r'/api/analysis/([a-zA-Z0-9_-]{1,80})',path)
+        if match:
+            return self._json(200,{'analysis':app.store.get('analysis:'+match.group(1))})
         if path=='/api/health':
             return self._json(200,{'ok':True})
         if path=='/api/bootstrap':
@@ -214,6 +304,15 @@ class Handler(BaseHTTPRequestHandler):
             if size < 1 or size > 65536:
                 return self._json(413,{'error':'请求体必须为1–65536字节'})
             payload = json.loads(self.rfile.read(size).decode('utf-8'))
+            if self.path in ('/api/analysis','/api/tracking/check'):
+                try:
+                    return self._json(202,{'job':self.server.app.start_aux('analysis' if self.path=='/api/analysis' else 'tracking',payload)})
+                except RuntimeError as exc: return self._json(409,{'error':str(exc)})
+            if self.path=='/api/tracking':
+                app=self.server.app
+                if not isinstance(payload,dict) or set(payload)-{'report_id','item_id','item','tracked','repositories','confirmed'}: raise ValueError('追踪参数无效')
+                item=app.resolve_item(payload)
+                return self._json(200,{'item':track_item(app.store,item,payload.get('tracked',True),payload.get('repositories'),payload.get('confirmed',False))})
             if self.path=='/api/runs':
                 try:
                     return self._json(202,{'job':self.server.app.start_run(payload)})

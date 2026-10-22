@@ -104,5 +104,16 @@
   ],
   "background_note": "团队论文与录用信息仅用于匹配研究方向，不作为本周新增成果。",
   "source_url": "https://multimodality.group/",
-  "as_of": "2026-10-14"
+  "as_of": "2026-10-14",
+  "anchor_sources": {
+    "RemoteCLIP": "https://arxiv.org/abs/2306.11029",
+    "RemoteSAM": "https://arxiv.org/abs/2505.18022",
+    "RemoteReasoner": "https://arxiv.org/abs/2507.19280",
+    "RemoteAgent": "https://arxiv.org/abs/2604.07765",
+    "RemoteShield": "https://arxiv.org/abs/2604.17243",
+    "RemoteDescriber / ReconScore": "https://arxiv.org/abs/2604.22855",
+    "UEMM-Air": "https://arxiv.org/abs/2406.06230",
+    "AirNavigation": "https://ojs.aaai.org/index.php/AAAI/article/download/42356/46317",
+    "Making Large Vision Language Models to be Good Few-shot Learners": "https://arxiv.org/abs/2408.11297"
+  }
 }

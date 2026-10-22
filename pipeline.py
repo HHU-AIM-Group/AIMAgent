@@ -112,6 +112,11 @@ def collect_report(store, profile, settings, start, end, use_codex=True, progres
     report = dict(id=uuid.uuid4().hex[:16],start=start,end=end,created_at=sources.now_iso(),status='partial' if any(status['status'] in ('error','partial') for status in statuses) or not active or (use_codex and mode!='codex') else 'completed',summary=summary,analysis_mode=mode,papers=papers,news=news,conferences=conferences,sources=statuses,warnings=list(dict.fromkeys(warnings)),candidate_count=candidate_count,paper_count=len(papers),news_count=len(news),timezone='Asia/Shanghai',profile_as_of=profile.get('as_of'))
     report['ai_analyzed_count'] = sum(bool(item.get('ai_enriched')) for item in papers+news)
     report['retained_count'] = len(papers)+len(news)
+    if store.get('tracking:items',[]):
+        from tracking import check_tracked
+        progress(94,'tracking','正在检查跨周标记论文和代码更新。')
+        try: report['tracking_updates']=check_tracked(store)
+        except Exception as exc: report['warnings'].append('追踪检查未完成：'+str(exc)[:150])
     progress(97,'saving','正在将报告和来源覆盖记录保存到本机。')
     store.save_report(report)
     return report
@@ -125,8 +130,46 @@ def report_markdown(report):
         lines += ['## '+heading,'']
         for item in report[key]:
             lines += ['### '+safe(item['title']), '', '- 原文：'+item['url'], '- 来源：'+safe(item['source']), '- 日期：%s（%s）' % (safe(item['published_at']),safe(item['date_basis'])), '- 状态：'+safe(item['status']), '- 方向：'+', '.join(item['directions']), '- 阅读优先级：'+str(item['score']), '', safe(item['summary']), '', safe(item['why_it_matters']), '', '建议行动：'+safe(item['suggested_action']), '']
+            analysis=item.get('research_analysis')
+            if isinstance(analysis,dict):
+                lines += ['#### 单篇全文核对','']
+                document=analysis.get('full_text') or {}
+                if document.get('url'): lines += ['- 分析时取得正文：'+safe(document['url'])]
+                if document.get('fetched_at'): lines += ['- 正文取得时间：'+safe(document['fetched_at'])]
+                if document.get('version_note'): lines += ['- 版本说明：'+safe(document['version_note'])]
+                lines += ['- 核对状态：'+safe(analysis.get('status')),'']
+                if analysis.get('motivation'): lines += ['研究动机：'+safe(analysis['motivation']),'']
+                if analysis.get('problem'): lines += ['要解决的问题：'+safe(analysis['problem']),'']
+                if analysis.get('judgment_basis'): lines += [safe(analysis['judgment_basis']),'']
+                for claim in analysis.get('claims',[]):
+                    lines += ['- 主张：'+safe(claim.get('claim')), '  - 对应实验：'+safe(claim.get('experiment')), '  - 证据位置：'+safe(claim.get('evidence_location')), '  - 正文摘录：'+safe(claim.get('evidence_quote')), '  - 支撑判断：'+safe(claim.get('support'))]
+                    lines += ['  - 缺口：'+safe(value) for value in claim.get('gaps',[])]
+                    lines += ['']
+                for comparison in analysis.get('anchor_comparisons',[]):
+                    lines += ['##### 与 '+safe(comparison.get('anchor'))+' 比较','', '- 基准来源：'+safe(comparison.get('source_url')), '- 证据范围：'+safe(comparison.get('evidence_basis'))]
+                    for field,label in [('task','任务'),('data','数据'),('method','方法'),('supervision','监督条件'),('evaluation','评价'),('comparability','可比性')]:
+                        if comparison.get(field): lines += ['- '+label+'：'+safe(comparison[field])]
+                    lines += ['- 未知项：'+safe(value) for value in comparison.get('unknowns',[])]
+                    lines += ['- 可借鉴点：'+safe(value) for value in comparison.get('borrowable_points',[])]
+                    if comparison.get('minimal_experiment'): lines += ['- 最小实验：'+safe(comparison['minimal_experiment'])]
+                    lines += ['']
+                if analysis.get('limitations'):
+                    lines += ['核对局限：']+['- '+safe(value) for value in analysis['limitations']]+['']
             if len(item.get('sources',[])) > 1:
                 lines += ['来源证据：'] + ['- %s · %s · %s' % (safe(source['name']),safe(source.get('date_basis')),source['url']) for source in item['sources']] + ['']
+    tracking=report.get('tracking_updates')
+    if isinstance(tracking,dict):
+        lines += ['## 本次跨周追踪','']
+        checked=tracking.get('last_checked_at')
+        if checked: lines += ['检查时间：'+safe(checked),'']
+        changes=[change for change in tracking.get('changes',[]) if not checked or change.get('at')==checked]
+        if changes:
+            for change in changes:
+                lines += ['- '+safe(change.get('message')), '  - 论文：'+safe(change.get('item_id')), '  - 字段：'+safe(change.get('field')), '  - 之前：'+safe(change.get('before')), '  - 之后：'+safe(change.get('after'))]
+        else: lines += ['本次未发现已确认的新变化；首次成功检查仅建立基线。']
+        errors=[(row.get('item',{}).get('title',row.get('id')),error) for row in tracking.get('items',[]) for error in row.get('errors',[])]
+        if errors: lines += ['', '检查未完成的来源：']+['- '+safe(title)+' · '+safe(error.get('source'))+'：'+safe(error.get('message')) for title,error in errors]
+        lines += ['']
     lines += ['## 来源覆盖','']
     lines += ['- %s：%s · %s' % (safe(source['name']),safe(source['status']),safe(source['message'])) for source in report['sources']]
     lines += ['', '## 说明与局限', ''] + ['- '+safe(warning) for warning in report['warnings']]

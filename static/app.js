@@ -37,8 +37,22 @@ const views = {
   history: ['历史周报', '让每一周的发现，留下来。', '按采集区间回看本地周报，研究进展有迹可循。'],
   settings: ['设置与连接', '为你的研究，设好雷达。', '连接你自己的 Codex，选择信息来源，查看研究方向。']
 };
-const state = { view: 'overview', profile: { directions: fallbackDirections }, settings: {}, codex: null, reports: [], report: null, job: null, csrf: '', direction: '', source: '', search: '', saved: storage.get('saved', {}), read: storage.get('read', {}), useCodex: storage.get('use-codex', true), loaded: false, bootError: false, submitting: false };
+const state = { view: 'overview', profile: { directions: fallbackDirections }, settings: {}, codex: null, reports: [], report: null, job: null, csrf: '', direction: '', source: '', search: '', saved: readSavedItems(), read: storage.get('read', {}), useCodex: storage.get('use-codex', true), loaded: false, bootError: false, submitting: false };
 let pollTimer, pollFailures = 0, toastTimer, reportLoadVersion = 0;
+Object.assign(state, { tracking: [], trackingLoaded: false, trackingError: '', trackingJob: null, trackingOptOut: storage.get('tracking-opt-out', {}), trackingMigrating: false, analysis: {}, analysisLoading: new Set(), analysisJobs: {}, detailItem: null });
+
+function readSavedItems() {
+  const result = {};
+  const migrated = storage.get('saved-legacy-migrated', false);
+  (migrated ? ['saved'] : ['favorites', 'reading-list', 'saved']).forEach(name => {
+    const stored = storage.get(name, {});
+    (Array.isArray(stored) ? stored : Object.values(stored || {})).forEach(item => { if (item && typeof item === 'object' && (item.id || item.url || item.title)) result[String(item.id || item.url || item.title)] = item; });
+  });
+  if (!migrated) {
+    try { localStorage.setItem('aim-radar:saved', JSON.stringify(result)); localStorage.setItem('aim-radar:saved-legacy-migrated', 'true'); } catch { /* Read-only storage still permits this session to use the legacy list. */ }
+  }
+  return result;
+}
 
 function shanghaiToday() {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
@@ -93,10 +107,12 @@ async function bootstrap(initial = true) {
     const data = await api('/api/bootstrap');
     state.profile = data.profile || state.profile; state.settings = data.settings || {}; state.codex = data.codex; state.reports = data.reports || []; state.csrf = data.csrf_token || ''; state.loaded = true; state.bootError = false;
     if (initial) state.report = data.latest_report || null;
-    state.job = data.active_job || null;
+    state.job = data.active_job?.type && data.active_job.type !== 'report' ? null : data.active_job || null;
+    if (data.active_job?.type && data.active_job.type !== 'report') resumeFeatureJob(data.active_job);
     updateConnection(); updateCounts(); renderView(); renderReportContext(); renderJob();
     if (state.job && ['queued', 'running'].includes(state.job.status)) schedulePoll(400);
     if (!initial) notice('已重新连接本地服务。', true);
+    loadTracking().then(migrateSavedTracking);
   } catch (error) {
     state.loaded = true; state.bootError = true; updateConnection();
     notice(`无法连接本地服务：${error.message || '请确认 AIM Radar 服务正在运行。'}`);
@@ -262,14 +278,16 @@ function paperCard(item) {
   if (item.original_published_at && dateText(item.original_published_at) !== dateText(item.published_at)) add(meta, node('span', '', `· 首发 ${dateText(item.original_published_at)}`));
   if (!news) add(meta, node('span', '', '·'), node('span', '', publicStatus(item)));
   const tools = node('div', 'paper-tools');
-  add(tools, button('详情 ↗', '', () => openDetail(item)));
+  add(tools, button(news ? '详情 ↗' : '深读与核对 ↗', '', () => openDetail(item)));
+  if (!news && trackingFor(item)) add(kicker, badge('跨周追踪中', 'blue'));
   const saveButton = button(state.saved[key] ? '★ 已加入' : '☆ 加入清单', state.saved[key] ? 'is-saved' : '', () => toggleSaved(item)); saveButton.setAttribute('aria-label', `${state.saved[key] ? '移出清单' : '加入清单'}：${item.title}`); saveButton.setAttribute('aria-pressed', String(Boolean(state.saved[key])));
   const readButton = button(state.read[key] ? '✓ 已读' : '标记已读', '', () => { state.read[key] = !state.read[key]; storage.set('read', state.read); renderResults(); }); readButton.setAttribute('aria-pressed', String(Boolean(state.read[key])));
   add(tools, saveButton, readButton); add(footer, meta, tools); add(card, footer); return card;
 }
 function toggleSaved(item) {
-  const key = itemKey(item); if (state.saved[key]) { delete state.saved[key]; toast('已从个人阅读清单移出'); } else { state.saved[key] = { ...item, _saved_at: new Date().toISOString(), _report_id: state.report?.id, _is_news: itemIsNews(item) }; toast('已加入个人阅读清单'); }
+  const key = itemKey(item); if (state.saved[key]) { delete state.saved[key]; toast('已从个人阅读清单移出'); } else { state.saved[key] = { ...item, _saved_at: new Date().toISOString(), _report_id: item._report_id || reportIdFor(item), _is_news: itemIsNews(item) }; toast('已加入个人阅读清单'); }
   storage.set('saved', state.saved); updateCounts(); renderResults();
+  if (state.saved[key] && !itemIsNews(item) && !trackingStopped(item)) migrateSavedTracking();
 }
 function sourcePanel() {
   const panel = node('section', 'side-panel'); add(panel, add(node('h2'), document.createTextNode('信息来源'), node('span', '', 'SOURCE HEALTH')));
@@ -340,7 +358,7 @@ async function loadReport(id) {
   catch (error) { if (version === reportLoadVersion) notice(`无法打开周报：${error.message}`); }
 }
 function renderSaved(container) {
-  const toolbar = node('div', 'saved-toolbar'); add(toolbar, node('p', '', '个人标记仅保存在当前浏览器；清理浏览器数据会移除这些标记。\n清单中的条目保留其加入时的来源与摘要。'), button('导出阅读清单 ↓', 'button small', exportSaved)); add(container, toolbar, directionChips(), filters('papers'), node('div', 'result-meta'), node('div', 'paper-list')); renderResults();
+  const toolbar = node('div', 'saved-toolbar'); add(toolbar, node('p', '', '阅读标记保存在当前浏览器。开启跨周追踪后，检查记录另存于本机工作空间。\n旧清单可直接深读，或通过下方入口补充注册追踪。'), button('导出阅读清单 ↓', 'button small', exportSaved)); add(container, toolbar, trackingOverview(), directionChips(), filters('papers'), node('div', 'result-meta'), node('div', 'paper-list')); renderResults();
 }
 function downloadBlob(text, fileName, type) { const url = URL.createObjectURL(new Blob([text], { type })); const anchor = node('a'); anchor.href = url; anchor.download = fileName; document.body.append(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
 function exportSaved() {
@@ -393,6 +411,7 @@ async function saveSettings(event) {
   finally { if ($('#save-settings')) $('#save-settings').disabled = false; }
 }
 function openDetail(item) {
+  state.detailItem = item;
   const container = $('#detail-content'); container.replaceChildren();
   const kicker = node('div', 'paper-kicker'); (item.directions || []).forEach(id => add(kicker, badge(directionName(id)))); add(kicker, badge(item.source || '公开来源', 'outline'));
   const title = node('h2', 'detail-title', item.title || '研究详情'); title.id = 'detail-title';
@@ -410,6 +429,7 @@ function openDetail(item) {
   section('为什么与我们相关', item.why_it_matters);
   if (item.related_work?.length) section('关联的已有工作', item.related_work);
   section('建议的下一步', item.suggested_action);
+  if (!itemIsNews(item)) add(container, analysisPanel(item), trackingPanel(item));
   if (item.abstract && item.abstract !== item.summary) {
     const abstract = node('details', 'detail-section source-details');
     add(abstract, node('summary', '', '展开完整原始摘要'), node('p', '', item.abstract)); add(container, abstract);
@@ -420,7 +440,315 @@ function openDetail(item) {
   section('阅读提示', '摘要与关联分析基于公开摘要、元信息和公告，不等同于完整论文评审。社区收录或公开投稿不代表正式录用。');
   const footer = node('div', 'detail-footer'); add(footer, link('打开原始来源 ↗', item.url, 'button primary'), button(state.saved[itemKey(item)] ? '★ 移出阅读清单' : '☆ 加入阅读清单', 'button', () => { toggleSaved(item); openDetail(item); })); add(container, footer);
   if (!$('#detail-dialog').open) $('#detail-dialog').showModal();
+  if (!itemIsNews(item)) loadAnalysis(item);
 }
+// Deep reading and tracking remain separate jobs from weekly report generation.
+function reportIdFor(item) {
+  if (item._report_id) return item._report_id;
+  return [...(state.report?.papers || []), ...(state.report?.news || [])].some(entry => itemKey(entry) === itemKey(item)) ? state.report.id : undefined;
+}
+function workIdentity(item) {
+  let aid = String(item.arxiv_id || '').trim().replace(/^arxiv:/i, '');
+  if (!aid) {
+    try { const url = new URL(item.url); if (/(^|\.)arxiv\.org$/i.test(url.hostname)) aid = decodeURIComponent(url.pathname).replace(/^\/(abs|pdf|html)\//, '').replace(/\.pdf$/i, ''); } catch { /* Other sources retain their stable item ID. */ }
+  }
+  aid = aid.replace(/v\d+$/i, '');
+  return /^(?:\d{4}\.\d{4,5}|[a-z-]+\/\d{7})$/i.test(aid) ? `arxiv:${aid.toLowerCase()}` : itemKey(item);
+}
+function trackingStopped(item) { return Boolean(state.trackingOptOut[workIdentity(item)] || state.trackingOptOut[itemKey(item)]); }
+function setTrackingStopped(item, stopped) {
+  if (stopped) { state.trackingOptOut[workIdentity(item)] = true; state.trackingOptOut[itemKey(item)] = true; }
+  else {
+    delete state.trackingOptOut[workIdentity(item)]; delete state.trackingOptOut[itemKey(item)];
+    Object.values(state.saved).filter(saved => workIdentity(saved) === workIdentity(item)).forEach(saved => delete state.trackingOptOut[itemKey(saved)]);
+  }
+  storage.set('tracking-opt-out', state.trackingOptOut);
+}
+async function itemRequest(path, item, extra = {}) {
+  const payload = { report_id: reportIdFor(item), item_id: itemKey(item), item, ...extra };
+  try { return await api(path, { method: 'POST', body: JSON.stringify(payload) }); }
+  catch (error) {
+    if (!payload.report_id || error.status !== 400 || !/报告|条目不存在/.test(error.message)) throw error;
+    // A saved source snapshot remains usable after its original report is removed.
+    delete payload.report_id;
+    return api(path, { method: 'POST', body: JSON.stringify(payload) });
+  }
+}
+function detailRefresh(item) {
+  if ($('#detail-dialog').open && itemKey(state.detailItem || {}) === itemKey(item)) {
+    const dialog = $('#detail-dialog'), scroll = dialog.scrollTop;
+    const expanded = $$('details', dialog).filter(section => section.open).map(section => section.className);
+    const settings = $('.tracking-settings', dialog), repositories = settings && $('textarea', settings), confirmation = settings && $('[name="repositories_confirmed"]', settings);
+    const draft = settings?.open && repositories ? { repositories: repositories.value, confirmed: confirmation?.checked } : null;
+    const focused = document.activeElement === repositories;
+    const selection = focused ? [repositories.selectionStart, repositories.selectionEnd] : null;
+    openDetail(item);
+    $$('details', dialog).forEach(section => { if (expanded.includes(section.className)) section.open = true; });
+    if (draft) {
+      const next = $('.tracking-settings textarea', dialog), nextConfirmation = $('[name="repositories_confirmed"]', dialog);
+      if (next) { next.value = draft.repositories; if (focused) { next.focus({ preventScroll: true }); next.setSelectionRange(...selection); } }
+      if (nextConfirmation) nextConfirmation.checked = draft.confirmed;
+    }
+    dialog.scrollTop = scroll;
+  }
+}
+function listText(parent, values, empty = '') {
+  const items = (Array.isArray(values) ? values : values ? [values] : []).map(asText).filter(Boolean);
+  if (!items.length) { if (empty) add(parent, node('p', 'muted-copy', empty)); return; }
+  const list = node('ul', 'research-list'); items.forEach(value => add(list, node('li', '', value))); add(parent, list);
+}
+function labelledValue(parent, label, value, fallback = '未知 · 现有证据未提供') {
+  const row = node('div', 'evidence-row'); add(row, node('strong', '', label), node('p', '', asText(value) || fallback)); add(parent, row);
+}
+function jobStatus(job) {
+  const result = node('div', 'research-progress'); result.setAttribute('role', 'status');
+  const progress = Number(job.progress);
+  add(result, node('strong', '', job.message || (job.status === 'queued' ? '等待开始…' : '正在检查来源与证据…')));
+  if (Number.isFinite(progress)) { const bar = node('progress'); bar.max = 100; bar.value = Math.max(0, Math.min(100, progress)); bar.setAttribute('aria-label', '检查进度'); add(result, bar, node('span', '', `${Math.round(bar.value)}%`)); }
+  return result;
+}
+function analysisPanel(item) {
+  const key = itemKey(item), analysis = state.analysis[key] || item.research_analysis, job = state.analysisJobs[key];
+  const panel = node('section', 'detail-section research-panel');
+  add(panel, node('h3', '', '动机与实验核对'), node('p', 'muted-copy', '按需读取这篇论文，逐项核对作者主张、对应实验与证据位置，并与组内真实工作比较。'));
+  const run = button(analysis ? '重新核对这篇论文 ↻' : '开始动机与实验核对', 'button primary small', () => startAnalysis(item));
+  run.disabled = Boolean(job && ['queued', 'running'].includes(job.status)) || state.analysisLoading.has(key); add(panel, run);
+  if (state.analysisLoading.has(key) && !analysis) add(panel, node('p', 'inline-status', '正在读取已保存的核对结果…'));
+  if (job && ['queued', 'running'].includes(job.status)) { add(panel, jobStatus(job)); if (analysis) add(panel, node('p', 'inline-status', '正在重新核对；下方暂时保留上次已保存的结果。')); }
+  if (job?.status === 'failed' || job?.error) add(panel, node('p', 'inline-status error-text', `本次核对未完成：${job.error || job.message}。可重试；已有结果保留。`));
+  if (!analysis) { add(panel, badge('证据不足 · 尚未核对全文', 'amber'), node('p', 'inline-status', '当前摘要可辅助判断阅读价值；实验是否支撑主张，需取得全文后核对。')); return panel; }
+  const full = analysis.full_text || {}, hasFull = ['ok', 'available', 'fetched', 'ready', 'success'].includes(full.status);
+  const provenance = node('div', 'evidence-provenance');
+  add(provenance, badge(!hasFull ? '证据不足 · 未取得可核对全文' : analysis.status === 'completed' ? '已取得全文 · 已逐项核对' : '已取得全文 · 尚未完成证据核对', hasFull && analysis.status === 'completed' ? '' : 'amber'));
+  if (analysis.judgment_basis) add(provenance, node('p', '', analysis.judgment_basis));
+  if (analysis.created_at) add(provenance, node('span', '', `核对时间 ${dateText(analysis.created_at)} ${dateTime(analysis.created_at).split(' ').pop()}`));
+  add(provenance, node('p', '', '本次核对使用最近取得的正文，不限定为周报当时的论文版本。'));
+  if (full.message) add(provenance, node('p', '', full.message));
+  if (full.version_note) add(provenance, node('p', '', full.version_note));
+  if (safeUrl(full.url)) add(provenance, link('本次使用的原文 ↗', full.url));
+  add(panel, provenance);
+  labelledValue(panel, '研究动机', analysis.motivation, '证据不足 · 尚未确认研究动机');
+  labelledValue(panel, '要解决的问题', analysis.problem, '证据不足 · 尚未确认具体问题');
+  const claims = Array.isArray(analysis.claims) ? analysis.claims : [];
+  add(panel, node('h4', '', '作者主张 → 对应实验 → 支撑判定'));
+  if (!hasFull) add(panel, node('p', 'evidence-empty', '全文证据不足，暂不判定实验支持程度。请打开来源，或稍后重试核对。'));
+  else if (!claims.length) add(panel, node('p', 'evidence-empty', '未提取到可核对的主张与实验；不能据此认定已获支撑。'));
+  else claims.forEach((claim, index) => {
+    const card = node('article', 'claim-card');
+    const support = { supported: ['有证据支撑', ''], partial: ['部分支撑', 'amber'], unsupported: ['未充分支撑', 'red'], insufficient: ['证据不足', 'outline'] }[claim.support] || ['证据不足', 'outline'];
+    add(card, add(node('div', 'claim-heading'), node('h4', '', `主张 ${index + 1}`), badge(...support)));
+    labelledValue(card, '作者主张', claim.claim);
+    labelledValue(card, '对应实验 / 已验证点', claim.experiment);
+    labelledValue(card, '证据定位', claim.evidence_location, '未提供可复查的章节、表格或图号');
+    if (claim.evidence_quote) add(card, node('blockquote', 'evidence-quote', claim.evidence_quote));
+    add(card, node('strong', 'row-label', '缺口与待验证项')); listText(card, claim.gaps, '未列出具体缺口；仍需结合原文确认。'); add(panel, card);
+  });
+  if (analysis.limitations?.length) { add(panel, node('h4', '', '本次核对的限制')); listText(panel, analysis.limitations); }
+  add(panel, comparisonPanel(analysis)); return panel;
+}
+function comparisonPanel(analysis) {
+  const panel = node('section', 'comparison-panel'); add(panel, node('h3', '', '与组内工作逐项对比'));
+  const comparisons = Array.isArray(analysis.anchor_comparisons) ? analysis.anchor_comparisons : [];
+  if (!comparisons.length) { add(panel, node('p', 'evidence-empty', '尚无可核实的组内论文对比。完成全文核对后显示实际关联工作、来源和未知项。')); return panel; }
+  comparisons.forEach(entry => {
+    const card = node('article', 'comparison-card'), anchor = entry.anchor;
+    add(card, node('h4', '', asText(anchor) || '关联组内工作'));
+    const source = entry.source_url || anchor?.url; if (safeUrl(source)) add(card, link('核对组内论文来源 ↗', source));
+    labelledValue(card, '比较依据', entry.evidence_basis);
+    const table = node('table', 'comparison-table'), caption = node('caption', 'sr-only', '当前论文与组内工作的差异'); add(table, caption);
+    const body = node('tbody'); [['任务', 'task'], ['数据', 'data'], ['方法', 'method'], ['监督方式', 'supervision'], ['评估指标', 'evaluation']].forEach(([label, field]) => { const row = node('tr'); add(row, node('th', '', label), node('td', '', asText(entry[field]) || '未知 · 待查原文')); add(body, row); }); add(table, body); add(card, table);
+    labelledValue(card, '可比性与边界', entry.comparability);
+    labelledValue(card, '可借鉴点', entry.borrowable_points || entry.takeaways);
+    labelledValue(card, '最小实验方案', entry.minimal_experiment);
+    add(card, node('strong', 'row-label', '未知项')); listText(card, entry.unknowns, '未列明；不表示没有未知项。'); add(panel, card);
+  }); return panel;
+}
+async function loadAnalysis(item) {
+  const key = itemKey(item); if (Object.hasOwn(state.analysis, key) || state.analysisLoading.has(key)) return;
+  state.analysisLoading.add(key);
+  try { const data = await api(`/api/analysis/${encodeURIComponent(key)}`); if (data.analysis || !state.analysis[key]) state.analysis[key] = data.analysis || null; }
+  catch (error) {
+    if (!Object.hasOwn(state.analysis, key)) state.analysis[key] = item.research_analysis || null;
+    if (!['queued', 'running'].includes(state.analysisJobs[key]?.status)) state.analysisJobs[key] = { status: 'failed', error: `读取已有结果失败：${error.message}` };
+  }
+  finally { state.analysisLoading.delete(key); detailRefresh(item); }
+}
+async function startAnalysis(item) {
+  const key = itemKey(item); state.analysisJobs[key] = { status: 'queued', message: '正在启动本篇核对…' }; detailRefresh(item);
+  try {
+    const data = await itemRequest('/api/analysis', item);
+    state.analysisJobs[key] = data.job; detailRefresh(item);
+    await followFeatureJob(data.job, job => { state.analysisJobs[key] = job; if (job.analysis) state.analysis[key] = job.analysis; detailRefresh(item); });
+  } catch (error) { state.analysisJobs[key] = { status: 'failed', error: error.message }; detailRefresh(item); }
+}
+async function followFeatureJob(initial, update) {
+  let job = initial;
+  while (job && ['queued', 'running'].includes(job.status)) {
+    await new Promise(resolve => setTimeout(resolve, 1800));
+    job = (await api(`/api/jobs/${encodeURIComponent(job.id)}`)).job; update(job);
+  }
+}
+function resumeFeatureJob(job) {
+  if (job.type === 'tracking') {
+    state.trackingJob = job;
+    followFeatureJob(job, current => { state.trackingJob = current; if (state.view === 'saved') renderView(); if (state.detailItem) detailRefresh(state.detailItem); }).then(loadTracking).catch(error => { state.trackingJob = { status: 'failed', error: error.message }; if (state.view === 'saved') renderView(); });
+  } else if (job.item_id) {
+    state.analysisJobs[job.item_id] = job;
+    followFeatureJob(job, current => { state.analysisJobs[job.item_id] = current; if (current.analysis) state.analysis[job.item_id] = current.analysis; if (state.detailItem && itemKey(state.detailItem) === job.item_id) detailRefresh(state.detailItem); }).catch(error => { state.analysisJobs[job.item_id] = { status: 'failed', error: error.message }; if (state.detailItem) detailRefresh(state.detailItem); });
+  }
+}
+async function migrateSavedTracking() {
+  if (!state.trackingLoaded || state.trackingError || state.trackingMigrating) return;
+  state.trackingMigrating = true;
+  try {
+    for (const item of Object.values(state.saved).filter(item => !itemIsNews(item) && !trackingStopped(item))) {
+      if (trackingFor(item) || trackingStopped(item)) continue;
+      try { const data = await itemRequest('/api/tracking', item, { tracked: true }); if (data.item) state.tracking.push(data.item); }
+      catch { /* Keep legacy saved items available; the explicit registration action can retry. */ }
+    }
+  } finally { state.trackingMigrating = false; if (state.view === 'saved') renderView(); else renderResults(); if (state.detailItem) detailRefresh(state.detailItem); }
+}
+function trackingFor(item) { return state.tracking.find(entry => entry.id === itemKey(item) || workIdentity(entry.item || {}) === workIdentity(item)); }
+function trackingStatus(entry) {
+  if (entry.errors?.length) return ['检查失败 / 部分来源失败', 'red'];
+  if ((entry.changes || []).length) return ['发现真实变化', ''];
+  if (!entry.last_checked_at) return ['待首次检查', 'outline'];
+  const snapshot = entry.snapshot || {};
+  const known = snapshot.arxiv_version || snapshot.openreview_status || (snapshot.repositories || []).some(repo => repo.commit_sha) || ['code', 'weights', 'data'].some(field => snapshot[field]?.status && snapshot[field].status !== 'unknown');
+  if (!known) return ['尚未建立可比较基线', 'amber'];
+  return ['已建立基线 · 暂无新变化', 'blue'];
+}
+async function loadTracking() {
+  try { const data = await api('/api/tracking'); state.tracking = [...new Map((data.items || []).map(entry => [workIdentity(entry.item || { id: entry.id }), entry])).values()]; state.trackingLoaded = true; state.trackingError = ''; }
+  catch (error) { state.trackingLoaded = true; state.trackingError = error.message; }
+  if (state.view === 'saved') renderView(); else renderResults();
+  if (state.detailItem) detailRefresh(state.detailItem);
+}
+function trackingOverview() {
+  const panel = node('section', 'tracking-overview');
+  const heading = node('div', 'feature-heading'); add(heading, node('h2', '', '跨周追踪'), button('刷新状态 ↻', 'text-button', loadTracking)); add(panel, heading);
+  add(panel, node('p', 'muted-copy', '追踪记录保存在本机。本地服务运行期间每 24 小时复查，也可随时手动检查。首次成功观测只建立基线，之后才记录变化。'));
+  if (state.trackingError) add(panel, node('p', 'inline-status error-text', `暂时无法读取追踪记录：${state.trackingError}`));
+  else if (!state.trackingLoaded) add(panel, node('p', 'inline-status', '正在读取本机追踪记录…'));
+  const unsynced = Object.values(state.saved).filter(item => !itemIsNews(item) && !trackingFor(item) && !trackingStopped(item));
+  const actions = node('div', 'feature-actions');
+  if (unsynced.length) add(actions, button(`为 ${unsynced.length} 篇已收藏论文开启追踪`, 'button small', registerSaved));
+  const check = button('立即检查所有追踪论文 ↻', 'button small', () => checkTracking()); check.disabled = !state.tracking.length || Boolean(state.trackingJob && ['queued', 'running'].includes(state.trackingJob.status)); add(actions, check); add(panel, actions);
+  if (state.trackingJob && ['queued', 'running'].includes(state.trackingJob.status)) add(panel, jobStatus(state.trackingJob));
+  if (state.trackingJob?.status === 'failed') add(panel, node('p', 'inline-status error-text', state.trackingJob.error || state.trackingJob.message || '检查未完成，可重试。'));
+  if (!state.tracking.length) add(panel, node('p', 'inline-status', '尚未开启追踪。在论文详情中确认代码仓库并开启，或为已收藏论文批量开启。'));
+  state.tracking.forEach(entry => {
+    const row = node('div', 'tracking-row'); add(row, button(entry.item?.title || entry.id, 'tracked-title', () => openDetail({ ...entry.item, _report_id: entry.report_id })), badge(...trackingStatus(entry)), node('span', 'tracking-time', entry.last_checked_at ? `上次检查 ${dateTime(entry.last_checked_at)}` : '尚未检查')); add(panel, row);
+  }); return panel;
+}
+async function registerSaved() {
+  const items = Object.values(state.saved).filter(item => !itemIsNews(item) && !trackingFor(item) && !trackingStopped(item)); let count = 0, failures = [];
+  for (const item of items) {
+    if (trackingFor(item) || trackingStopped(item)) continue;
+    try { const data = await itemRequest('/api/tracking', item, { tracked: true }); if (data.item) { state.tracking.push(data.item); count++; } }
+    catch (error) { failures.push(`${trimText(item.title, 40)}：${error.message}`); }
+  }
+  await loadTracking(); toast(`已为 ${count} 篇论文开启追踪${failures.length ? `，${failures.length} 篇未成功` : ''}`);
+  if (failures.length) notice(failures.join('\n'));
+}
+function trackingPanel(item) {
+  const entry = trackingFor(item), panel = node('section', 'detail-section research-panel');
+  const heading = node('div', 'feature-heading'); add(heading, node('h3', '', '跨周追踪与变化提醒'), badge(entry ? trackingStatus(entry)[0] : '未开启追踪', entry ? trackingStatus(entry)[1] : 'outline')); add(panel, heading);
+  add(panel, node('p', 'muted-copy', '持续复查论文版本、公开状态与已确认代码仓库。代码、权重和数据分别记录；检查失败不会算作内容变化。'));
+  if (state.trackingError) add(panel, node('p', 'inline-status error-text', `追踪记录暂不可用：${state.trackingError}`));
+  if (entry?.last_checked_at) add(panel, node('p', 'inline-status', `最近检查 ${dateTime(entry.last_checked_at)}`));
+  if (entry?.repositories?.length) add(panel, badge(entry.confirmed ? '仓库归属已确认 · 未验证实现完整性' : '仓库归属待确认', entry.confirmed ? 'blue' : 'amber'));
+  if (entry) {
+    const snapshot = entry.snapshot || {}, assets = node('div', 'asset-grid');
+    [['代码', 'code'], ['权重', 'weights'], ['数据', 'data']].forEach(([label, field]) => {
+      const value = snapshot[field], block = node('div', 'asset-status'); add(block, node('strong', '', label), node('span', '', assetText(value))); if (value && typeof value === 'object' && safeUrl(value.url)) add(block, link('查看来源 ↗', value.url)); add(assets, block);
+    }); add(panel, assets);
+    if (snapshot.arxiv_version) labelledValue(panel, '论文版本', snapshot.arxiv_version);
+    if (snapshot.openreview_status) labelledValue(panel, '公开评审 / 录用状态', snapshot.openreview_status);
+    (snapshot.repositories || []).forEach(repo => {
+      const block = node('div', 'repository-snapshot');
+      add(block, link(repo.url || '已确认仓库', repo.url));
+      if (repo.commit_sha) labelledValue(block, '最近提交', repo.commit_sha);
+      if (repo.release) labelledValue(block, '最近发布', repo.release);
+      add(panel, block);
+    });
+    if (entry.errors?.length) { const errors = node('div', 'tracking-errors'); add(errors, node('strong', '', '检查失败（未计为变化）')); listText(errors, entry.errors.map(error => typeof error === 'string' ? error : `${error.source || error.url || '来源'}：${error.message || error.error || '无法读取'}`)); add(panel, errors); }
+    add(panel, changesDetails(entry));
+  }
+  const settings = node('details', 'tracking-settings'); add(settings, node('summary', '', entry ? '监督设置 · 编辑与确认代码仓库' : '监督设置 · 开启追踪'));
+  const form = node('form'), repositoryField = formField('代码仓库地址', 'repositories', repositoryUrls(entry, item).join('\n'), '每行一个 https://github.com/作者/仓库，最多 5 个。请核对作者归属；留空表示暂未确认仓库。', true);
+  const confirmRow = node('label', 'confirm-repository'), confirm = node('input'); confirm.type = 'checkbox'; confirm.name = 'repositories_confirmed'; confirm.checked = Boolean(entry?.confirmed); $('textarea', repositoryField).addEventListener('input', () => { confirm.checked = false; }); add(confirmRow, confirm, node('span', '', '我已核对这些仓库属于该论文，可纳入后续检查'));
+  const feedback = node('p', 'inline-status'); feedback.setAttribute('role', 'status');
+  const submit = node('button', 'button primary small', entry ? '保存监督设置' : '开启跨周追踪'); submit.type = 'submit';
+  add(form, repositoryField, confirmRow, submit, feedback);
+  form.addEventListener('submit', async event => {
+    event.preventDefault(); const repositories = $('[name="repositories"]', form).value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    if (repositories.length > 5 || repositories.some(url => !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/.test(url))) { feedback.textContent = '请填写有效的 https://github.com/作者/仓库 地址，最多 5 个。'; return; }
+    if (repositories.length && !confirm.checked) { feedback.textContent = '请先核对并勾选仓库归属，或留空后开启论文追踪。'; return; }
+    submit.disabled = true; feedback.textContent = '正在保存…';
+    try { await itemRequest('/api/tracking', item, { tracked: true, repositories, confirmed: confirm.checked }); setTrackingStopped(item, false); await loadTracking(); toast('监督设置已保存；下次成功检查将建立或更新基线。'); }
+    catch (error) { feedback.textContent = `保存失败：${error.message}`; }
+    finally { submit.disabled = false; }
+  });
+  const candidates = entry?.snapshot?.candidate_repositories || [];
+  if (candidates.length) {
+    const candidateBox = node('div', 'repository-candidates'); add(candidateBox, node('strong', '', '从论文页面发现的候选仓库 · 归属待确认'), node('p', 'inline-status', '候选可能来自引用或相关工作。请先打开核对，再填入并确认。'));
+    candidates.forEach(candidate => {
+      const row = node('div', 'candidate-row'); add(row, link(candidate.url, candidate.url));
+      if (candidate.evidence_source) add(row, link('发现来源 ↗', candidate.evidence_source));
+      add(row, button('填入仓库设置', 'button small', () => {
+        const input = $('[name="repositories"]', form), values = input.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+        if (!values.includes(candidate.url)) values.push(candidate.url); input.value = values.join('\n'); confirm.checked = false; input.focus(); feedback.textContent = '已填入候选，请核对归属、勾选确认后保存。';
+      })); add(candidateBox, row);
+    }); add(settings, candidateBox);
+  }
+  add(settings, form); add(panel, settings);
+  if (entry) {
+    const actions = node('div', 'feature-actions'), check = button('立即检查所有追踪论文 ↻', 'button small', () => checkTracking(item)); check.disabled = Boolean(state.trackingJob && ['queued', 'running'].includes(state.trackingJob.status));
+    add(actions, check, button('停止追踪', 'text-button', async () => {
+      try { await itemRequest('/api/tracking', item, { tracked: false }); setTrackingStopped(item, true); await loadTracking(); toast('已停止追踪，阅读清单中的论文仍可查看。'); }
+      catch (error) { toast(`未能停止追踪：${error.message}`); }
+    })); add(panel, actions);
+  }
+  if (state.trackingJob && ['queued', 'running'].includes(state.trackingJob.status)) add(panel, jobStatus(state.trackingJob)); return panel;
+}
+function repositoryUrls(entry, item) {
+  const values = entry?.repositories ?? entry?.snapshot?.repositories ?? item.repositories ?? (item.code_url ? [item.code_url] : []);
+  return (Array.isArray(values) ? values : [values]).map(value => typeof value === 'string' ? value : value?.url).filter(value => safeUrl(value));
+}
+function assetText(value) {
+  if (value == null) return '未知 · 尚无核实记录';
+  if (typeof value === 'boolean') return value ? '已发现公开链接' : '未发现公开链接';
+  if (typeof value === 'object') return value.message || assetText(value.status ?? value.available);
+  return ({ available: '已发现公开链接', open: '已开源', public: '已公开', released: '已发布', unavailable: '尚未发现公开链接', not_found: '尚未发现公开链接', unknown: '未知 · 尚待核实', not_checked: '尚未检查', not_released: '暂未发布', closed: '暂未公开' })[String(value)] || String(value);
+}
+function changeValue(value) { return value && typeof value === 'object' ? assetText(value) : asText(value); }
+function changesDetails(entry) {
+  const changes = entry.changes || [], details = node('details', 'change-details');
+  add(details, node('summary', '', `查看变化详情 · ${changes.length} 条`));
+  if (!changes.length) add(details, node('p', 'inline-status', entry.last_checked_at ? '当前没有记录到真实变化；首次成功检查仅建立基线。' : '首次检查后显示结果。'));
+  changes.slice().sort((a, b) => String(b.at || b.detected_at || '').localeCompare(String(a.at || a.detected_at || ''))).forEach(change => {
+    const block = node('article', 'change-card');
+    if (typeof change === 'string') add(block, node('p', '', change));
+    else {
+      add(block, node('strong', '', change.title || change.summary || change.message || change.field || change.type || '来源发生变化'));
+      if (change.checked_at || change.detected_at || change.at) add(block, node('span', 'tracking-time', dateTime(change.checked_at || change.detected_at || change.at)));
+      if (change.before !== undefined || change.old !== undefined) labelledValue(block, '此前', changeValue(change.before ?? change.old), '未记录');
+      if (change.after !== undefined || change.new !== undefined) labelledValue(block, '现在', changeValue(change.after ?? change.new), '未记录');
+      if (safeUrl(change.url || change.source_url)) add(block, link('复查变化来源 ↗', change.url || change.source_url));
+    } add(details, block);
+  }); return details;
+}
+async function checkTracking(item) {
+  state.trackingJob = { status: 'queued', message: '正在启动追踪检查…' }; if (state.view === 'saved') renderView(); if (state.detailItem) detailRefresh(state.detailItem);
+  const update = job => { state.trackingJob = job; if (state.view === 'saved') renderView(); if (state.detailItem) detailRefresh(state.detailItem); };
+  try {
+    const data = await api('/api/tracking/check', { method: 'POST', body: '{}' }); update(data.job);
+    await followFeatureJob(data.job, update); await loadTracking();
+    if (state.trackingJob?.status === 'completed') toast('检查已完成。基线、真实变化与失败项已分别更新。');
+  } catch (error) { update({ status: 'failed', error: `检查未完成：${error.message}。已有追踪记录保留，可重试。` }); }
+}
+
 function renderJob() {
   const active = state.job && ['queued', 'running'].includes(state.job.status);
   $('#job-panel').classList.toggle('hidden', !active); $('#generate-button').disabled = Boolean(active) || state.submitting || state.bootError || !state.loaded;

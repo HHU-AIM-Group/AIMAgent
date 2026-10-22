@@ -24,6 +24,10 @@ SHANGHAI = dt.timezone(dt.timedelta(hours=8))
 ARXIV_LOCK = threading.Lock()
 ARXIV_LAST = 0.0
 MAX_RESPONSE = 8 * 1024 * 1024
+# Some local VPNs map these exact public publisher names into RFC2544 fake-IP space.
+# HTTPS certificate verification remains enabled; arbitrary names/private ranges stay blocked.
+FAKE_IP_PUBLISHERS = frozenset(('arxiv.org','export.arxiv.org','huggingface.co','openreview.net','api2.openreview.net','api.github.com','github.com','openaccess.thecvf.com','proceedings.mlr.press','aclanthology.org','openai.com','www.anthropic.com','deepmind.google','www.microsoft.com','blogs.nvidia.com','ai.meta.com','qwenlm.github.io','www.baai.ac.cn','www.kimi.ai','multimodality.group','ojs.aaai.org'))
+FAKE_IP_NETWORK = ipaddress.ip_network('198.18.0.0/15')
 
 
 def now_iso():
@@ -86,7 +90,7 @@ def validate_public_url(url, resolve=True):
             addresses = [ipaddress.ip_address(row[4][0]) for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)]
         except socket.gaierror as exc:
             raise ValueError('Source hostname could not be resolved') from exc
-    if not addresses or any(not addr.is_global for addr in addresses):
+    if not addresses or any(not addr.is_global and not (host in FAKE_IP_PUBLISHERS and addr.version==4 and addr in FAKE_IP_NETWORK) for addr in addresses):
         raise ValueError('Local/private source addresses are not allowed')
     return url
 
